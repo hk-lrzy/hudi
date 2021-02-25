@@ -18,6 +18,21 @@
 
 package org.apache.hudi.operator.partitioner;
 
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.api.common.state.MapState;
+import org.apache.flink.api.common.state.MapStateDescriptor;
+import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.common.typeinfo.Types;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.state.CheckpointListener;
+import org.apache.flink.runtime.state.FunctionInitializationContext;
+import org.apache.flink.runtime.state.FunctionSnapshotContext;
+import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
+import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
+import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.util.Collector;
+
+import org.apache.hadoop.fs.Path;
 import org.apache.hudi.client.FlinkTaskContextSupplier;
 import org.apache.hudi.client.common.HoodieFlinkEngineContext;
 import org.apache.hudi.common.config.SerializableConfiguration;
@@ -36,21 +51,6 @@ import org.apache.hudi.operator.FlinkOptions;
 import org.apache.hudi.table.HoodieTable;
 import org.apache.hudi.table.action.commit.BucketInfo;
 import org.apache.hudi.util.StreamerUtil;
-
-import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.api.common.state.MapState;
-import org.apache.flink.api.common.state.MapStateDescriptor;
-import org.apache.flink.api.common.typeinfo.TypeInformation;
-import org.apache.flink.api.common.typeinfo.Types;
-import org.apache.flink.configuration.Configuration;
-import org.apache.flink.runtime.state.CheckpointListener;
-import org.apache.flink.runtime.state.FunctionInitializationContext;
-import org.apache.flink.runtime.state.FunctionSnapshotContext;
-import org.apache.flink.runtime.state.KeyGroupRangeAssignment;
-import org.apache.flink.streaming.api.checkpoint.CheckpointedFunction;
-import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
-import org.apache.flink.util.Collector;
-import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -121,6 +121,8 @@ public class BucketAssignFunction<K, I, O extends HoodieRecord<?>>
    */
   private boolean allPartitionsLoaded = false;
 
+  private transient boolean needInitialPartition;
+
   public BucketAssignFunction(Configuration conf) {
     this.conf = conf;
     this.isChangingRecords = WriteOperationType.isChangingRecords(
@@ -164,13 +166,17 @@ public class BucketAssignFunction<K, I, O extends HoodieRecord<?>>
         new MapStateDescriptor<>("partitionLoadState", Types.STRING, Types.INT);
     partitionLoadState = context.getKeyedStateStore().getMapState(partitionLoadStateDesc);
     if (context.isRestored()) {
-      checkPartitionsLoaded();
+      needInitialPartition = true;
     }
   }
 
   @SuppressWarnings("unchecked")
   @Override
   public void processElement(I value, Context ctx, Collector<O> out) throws Exception {
+    if (needInitialPartition) {
+      checkPartitionsLoaded();
+      needInitialPartition = false;
+    }
     // 1. put the record into the BucketAssigner;
     // 2. look up the state for location, if the record has a location, just send it out;
     // 3. if it is an INSERT, decide the location using the BucketAssigner then send it out.
@@ -216,7 +222,7 @@ public class BucketAssignFunction<K, I, O extends HoodieRecord<?>>
     // Refresh the table state when there are new commits.
     this.bucketAssigner.reset();
     this.bucketAssigner.refreshTable();
-    checkPartitionsLoaded();
+    this.needInitialPartition = true;
   }
 
   /**
